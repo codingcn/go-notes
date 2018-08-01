@@ -25,7 +25,7 @@ var (
 
 func main() {
 	//getIp("local")
-	getIp("http://122.235.169.204:8118")
+	getIp("http://180.118.86.44:9000")
 }
 
 func getIp(ip string) {
@@ -34,6 +34,9 @@ func getIp(ip string) {
 	for i := 1; i <= PAGE; i++ {
 		response := getRep(xici+strconv.Itoa(i), ip)
 		if (response.StatusCode == 200) {
+			// 这是一个可用ip，我们可以存起来
+			saveAvailableIpRedis(ip)
+
 			dom, err := goquery.NewDocumentFromReader(response.Body)
 			if err != nil {
 				log.Fatalf("失败原因", response.StatusCode)
@@ -59,7 +62,7 @@ func getIp(ip string) {
 				hBody, _ := json.Marshal(ipInfo[ip])
 
 				//存入redis
-				saveRedis(ip+":"+port, string(hBody))
+				saveMixIpRedis(ip+":"+port, string(hBody))
 				fmt.Println(ipInfo)
 				count++
 			})
@@ -81,7 +84,6 @@ func getRep(urls string, ip string) *http.Response {
 	proxy, err := url.Parse(ip)
 	//设置超时时间
 	timeout := time.Duration(20 * time.Second)
-	fmt.Printf("使用代理:%s\n", proxy)
 	client := &http.Client{}
 	if ip != "local" {
 		client = &http.Client{
@@ -104,6 +106,7 @@ func getRep(urls string, ip string) *http.Response {
 			log.Fatalf("Redis无可用ip")
 		}
 	}
+
 
 	return response
 }
@@ -128,8 +131,7 @@ func getAgent() string {
 	len := len(agent)
 	return agent[r.Intn(len)]
 }
-
-func saveRedis(ip string, hBody string) {
+func saveAvailableIpRedis(ip string) {
 	c, err := redis.Dial("tcp", "127.0.0.1:6379")
 	if err != nil {
 		fmt.Println("Connect to redis error", err)
@@ -138,9 +140,25 @@ func saveRedis(ip string, hBody string) {
 
 	defer c.Close()
 	//键值对的方式存入hash
-	_, err = c.Do("HSET", "ippool", ip, string(hBody))
+	//_, err = c.Do("HSET", "AVA_IP_POOL", ip, string(hBody))
 	//将ip:port 存入set  方便返回随机的ip
-	_, err = c.Do("SADD", "ippoolkey", ip)
+	_, err = c.Do("SADD", "AVA_IP_POOL_KEY", ip)
+	if err != nil {
+		log.Fatalf("err:%s", err)
+	}
+}
+func saveMixIpRedis(ip string, hBody string) {
+	c, err := redis.Dial("tcp", "127.0.0.1:6379")
+	if err != nil {
+		fmt.Println("Connect to redis error", err)
+		return
+	}
+
+	defer c.Close()
+	//键值对的方式存入hash
+	_, err = c.Do("HSET", "MIX_IP_POOL", ip, string(hBody))
+	//将ip:port 存入set  方便返回随机的ip
+	_, err = c.Do("SADD", "MIX_IP_POOL_KEY", ip)
 	if err != nil {
 		log.Fatalf("err:%s", err)
 	}
@@ -158,11 +176,11 @@ func returnIp() string {
 
 	defer c.Close()
 
-	key, err := redis.String(c.Do("SRANDMEMBER", "ippoolkey"))
+	key, err := redis.String(c.Do("SRANDMEMBER", "MIX_IP_POOL_KEY"))
 	if key == "" {
 		return ""
 	}
-	res, err := redis.String(c.Do("HGET", "ippool", key))
+	res, err := redis.String(c.Do("HGET", "MIX_IP_POOL", key))
 	res = strings.TrimLeft(res, "[")
 	res = strings.TrimRight(res, "]")
 
