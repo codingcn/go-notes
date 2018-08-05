@@ -4,11 +4,10 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"log"
 	"fmt"
-	"github.com/garyburd/redigo/redis"
+	"github.com/gomodule/redigo/redis"
 	"net/url"
 	"net/http"
 	"encoding/json"
-	"os"
 	"strconv"
 	"math/rand"
 	"time"
@@ -16,18 +15,35 @@ import (
 )
 
 const (
-	PAGE int = 400
+	PAGE int = 40
 )
 
 var (
-	xici string = "http://www.xicidaili.com/nn/"
+	xici        string = "http://www.xicidaili.com/nn/"
+	checkUrl    string = "https://www.baidu.com"
+	pool        *redis.Pool
+	redisServer = "127.0.0.1:6379"
 )
 
 func main() {
+	for i := 0; i < 100; i++ {
+		go func() {
+			for {
+				checkAvailableIp()
+			}
+		}()
+	}
 	//getIp("local")
 	getIp("http://180.118.86.44:9000")
-}
 
+}
+func newPool(addr string) *redis.Pool {
+	return &redis.Pool{
+		MaxIdle:     3000,
+		IdleTimeout: 240 * time.Second,
+		Dial:        func() (redis.Conn, error) { return redis.Dial("tcp", addr) },
+	}
+}
 func getIp(ip string) {
 	var count int
 
@@ -58,7 +74,6 @@ func getIp(ip string) {
 				//验证时间
 				checkTime := context.Find("td").Eq(9).Text()
 				ipInfo[ip] = append(ipInfo[ip], ip, port, address, anonymous, protocol, survivalTime, checkTime)
-				fmt.Println(ipInfo)
 				hBody, _ := json.Marshal(ipInfo[ip])
 
 				//存入redis
@@ -107,7 +122,6 @@ func getRep(urls string, ip string) *http.Response {
 		}
 	}
 
-
 	return response
 }
 
@@ -131,56 +145,84 @@ func getAgent() string {
 	len := len(agent)
 	return agent[r.Intn(len)]
 }
-func saveAvailableIpRedis(ip string) {
-	c, err := redis.Dial("tcp", "127.0.0.1:6379")
-	if err != nil {
-		fmt.Println("Connect to redis error", err)
-		return
+
+func checkAvailableIp() {
+	ip := returnIp()
+	if ip != "" {
+		fmt.Printf("验证ip %s\n", ip)
+	} else {
+		log.Fatalf("Redis无可用ip")
+	}
+	request, _ := http.NewRequest("GET", checkUrl, nil)
+	//随机返回User-Agent 信息
+	request.Header.Set("User-Agent", getAgent())
+	request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	request.Header.Set("Connection", "keep-alive")
+	fmt.Printf("ipppp1 %s\n", ip)
+	proxy, err := url.Parse(ip)
+	fmt.Printf("ipppp2 %s\n", ip)
+	//设置超时时间
+	timeout := time.Duration(20 * time.Second)
+	client := &http.Client{}
+	if ip != "local" {
+		client = &http.Client{
+			Transport: &http.Transport{
+				//TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				Proxy: http.ProxyURL(proxy),
+			},
+			Timeout: timeout,
+		}
 	}
 
-	defer c.Close()
-	//键值对的方式存入hash
-	//_, err = c.Do("HSET", "AVA_IP_POOL", ip, string(hBody))
-	//将ip:port 存入set  方便返回随机的ip
-	_, err = c.Do("SADD", "AVA_IP_POOL_KEY", ip)
+	response, err := client.Do(request)
+	if err != nil || response.StatusCode != 200 {
+		fmt.Printf("代理ip验证不可用 %s\n", err)
+		checkAvailableIp()
+	} else {
+		fmt.Printf("恭喜你，IP可用 %s\n", ip)
+		saveAvailableIpRedis(ip)
+	}
+}
+func saveAvailableIpRedis(ip string) {
+	pool = newPool(redisServer)
+	conn := pool.Get()
+	u, err := url.Parse(ip)
+	if err != nil {
+		log.Fatalf("ip parse err:%s , %s", ip, err)
+	}
+	// 可用的IP代理池，键值对的方式存入hash
+	_, err = conn.Do("HSET", "AVA_IP_POOL", u.Hostname(), string(ip))
 	if err != nil {
 		log.Fatalf("err:%s", err)
 	}
 }
 func saveMixIpRedis(ip string, hBody string) {
-	c, err := redis.Dial("tcp", "127.0.0.1:6379")
-	if err != nil {
-		fmt.Println("Connect to redis error", err)
-		return
-	}
-
-	defer c.Close()
+	pool = newPool(redisServer)
+	conn := pool.Get()
+	defer conn.Close()
 	//键值对的方式存入hash
-	_, err = c.Do("HSET", "MIX_IP_POOL", ip, string(hBody))
+	conn.Do("HSET", "MIX_IP_POOL", ip, string(hBody))
 	//将ip:port 存入set  方便返回随机的ip
-	_, err = c.Do("SADD", "MIX_IP_POOL_KEY", ip)
-	if err != nil {
-		log.Fatalf("err:%s", err)
-	}
+	conn.Do("SADD", "MIX_IP_POOL_KEY", ip)
 }
 
 /**
 * 随机返回一个IP
 */
 func returnIp() string {
-	c, err := redis.Dial("tcp", "127.0.0.1:6379")
+	pool = newPool(redisServer)
+	conn := pool.Get()
+	key, err := redis.String(conn.Do("SPOP", "MIX_IP_POOL_KEY"))
 	if err != nil {
-		fmt.Println("Connect to redis error", err)
-		os.Exit(0)
+		panic(err)
 	}
-
-	defer c.Close()
-
-	key, err := redis.String(c.Do("SRANDMEMBER", "MIX_IP_POOL_KEY"))
 	if key == "" {
 		return ""
 	}
-	res, err := redis.String(c.Do("HGET", "MIX_IP_POOL", key))
+	res, err := redis.String(conn.Do("HGET", "MIX_IP_POOL", key))
+	if err != nil {
+		panic(err)
+	}
 	res = strings.TrimLeft(res, "[")
 	res = strings.TrimRight(res, "]")
 
